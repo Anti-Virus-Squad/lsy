@@ -1,0 +1,512 @@
+/*
+ * Copyright (c) 1999 - 2005 NetGroup, Politecnico di Torino (Italy)
+ * Copyright (c) 2005 - 2006 CACE Technologies, Davis (California)
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the Politecnico di Torino, CACE Technologies
+ * nor the names of its contributors may be used to endorse or promote
+ * products derived from this software without specific prior written
+ * permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+
+#ifdef _MSC_VER
+ /*
+  * we do not want the warnings about the old deprecated and unsecure CRT functions
+  * since these examples can be compiled under *nix as well
+  */
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "pcap.h"
+#include <Iphlpapi.h>
+#include <windows.h>
+#include<stdbool.h>
+#include<stdlib.h>
+#pragma comment(lib, "Iphlpapi")
+#pragma comment(lib, "WS2_32")
+FILE* fp = NULL;
+#define LIMIT 1024//流量告警1kb
+ULONGLONG last_sec;//警报间隔计时
+
+//统计表输出计时
+ULONGLONG last_recv_output;
+ULONGLONG last_send_output;
+
+/* 4 bytes IP address */
+typedef struct ip_address
+{
+	u_char byte1;
+	u_char byte2;
+	u_char byte3;
+	u_char byte4;
+}ip_address;
+
+//MAC地址
+typedef struct mac_address {
+	u_char byte0;
+	u_char byte1;
+	u_char byte2;
+	u_char byte3;
+	u_char byte4;
+	u_char byte5;
+}mac_address;
+
+/* IPv4 header */
+typedef struct ip_header
+{
+	u_char	ver_ihl;		// Version (4 bits) + Internet header length (4 bits)
+	u_char	tos;			// Type of service 
+	u_short tlen;			// Total length 
+	u_short identification; // Identification
+	u_short flags_fo;		// Flags (3 bits) + Fragment offset (13 bits)
+	u_char	ttl;			// Time to live
+	u_char	proto;			// Protocol
+	u_short crc;			// Header checksum
+	ip_address	saddr;		// Source address
+	ip_address	daddr;		// Destination address
+	u_int	op_pad;			// Option + Padding
+}ip_header;
+
+typedef struct mac_header
+{
+	u_char	dest_addr[6];
+	u_char	src_addr[6];
+	u_char type[2];
+}mac_header;
+
+/* UDP header*/
+typedef struct udp_header
+{
+	u_short sport;			// Source port
+	u_short dport;			// Destination port
+	u_short len;			// Datagram length
+	u_short crc;			// Checksum
+}udp_header;
+
+//流量记录
+typedef struct FLOW_STATEMENT {
+	mac_address MAC;		//源/目的MAC地址
+	ip_address IP;			//源/目的IP地址
+	unsigned total;	//一段时间内的总流量
+}FLOW_STATEMENT;
+
+//流量记录表
+typedef struct FLOW_LIST {
+	FLOW_STATEMENT* HEAD;//表头
+	int length;//表长
+}FLOW_LIST;
+
+FLOW_LIST* flow_alarm_list;//限制表
+mac_address self_mac_addr;//本设备MAC地址
+
+
+
+FLOW_LIST* flow_alarm_list;//限制表
+FLOW_LIST* flow_recv_list;//受到表
+FLOW_LIST* flow_send_list;//发送表
+
+void add_alarm_flow(mac_address* mac_addr, ip_address* ip_addr, int flow);
+void add_send_flow(mac_address* mac_addr, ip_address* ip_addr, int flow);
+void add_recv_flow(mac_address* mac_addr, ip_address* ip_addr, int flow);
+
+/* prototype of the packet handler */
+void packet_handler(u_char* param, const struct pcap_pkthdr* header, const u_char* pkt_data);
+
+int main()
+{
+	pcap_if_t* alldevs;
+	pcap_if_t* d;
+	int inum;
+	int i = 0;
+	pcap_t* adhandle;
+	char errbuf[PCAP_ERRBUF_SIZE];
+	u_int netmask;
+	char packet_filter[] = "ip and udp";
+	struct bpf_program fcode;
+	//struct timeval st_ts;
+
+	fp = fopen("d:\\data.txt", "a");
+	setbuf(fp, NULL);
+	if (fp == NULL)
+	{
+		printf("File cannot open! ");
+		exit(0);
+	}
+
+	/* Retrieve the device list */
+	if (pcap_findalldevs(&alldevs, errbuf) == -1)
+	{
+		fprintf(stderr, "Error in pcap_findalldevs: %s\n", errbuf);
+		exit(1);
+	}
+
+	/* Print the list */
+	for (d = alldevs; d; d = d->next)
+	{
+		printf("%d. %s", ++i, d->name);
+		if (d->description)
+			printf(" (%s)\n", d->description);
+		else
+			printf(" (No description available)\n");
+	}
+
+	if (i == 0)
+	{
+		printf("\nNo interfaces found! Make sure WinPcap is installed.\n");
+		return -1;
+	}
+
+	//初始化流量统计
+	//流量警告表
+	if ((flow_alarm_list = (FLOW_LIST*)malloc(sizeof(FLOW_LIST))) == NULL)
+		exit(-1);
+	if ((flow_alarm_list->HEAD = (FLOW_STATEMENT*)malloc(sizeof(FLOW_STATEMENT))) == NULL)
+		exit(-1);
+	flow_alarm_list->length = 0;
+
+	//流量发送表
+	if ((flow_recv_list = (FLOW_LIST*)malloc(sizeof(FLOW_LIST))) == NULL)
+		exit(-1);
+	if ((flow_recv_list->HEAD = (FLOW_STATEMENT*)malloc(sizeof(FLOW_STATEMENT))) == NULL)
+		exit(-1);
+	flow_recv_list->length = 0;
+
+	//流量接收表
+	if ((flow_send_list = (FLOW_LIST*)malloc(sizeof(FLOW_LIST))) == NULL)
+		exit(-1);
+	if ((flow_send_list->HEAD = (FLOW_STATEMENT*)malloc(sizeof(FLOW_STATEMENT))) == NULL)
+		exit(-1);
+	flow_send_list->length = 0;
+
+	printf("Enter the interface number (1-%d):", i);
+	scanf_s("%d", &inum);
+
+	/* Check if the user specified a valid adapter */
+	if (inum < 1 || inum > i)
+	{
+		printf("\nAdapter number out of range.\n");
+
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	/* Jump to the selected adapter */
+	for (d = alldevs, i = 0; i < inum - 1; d = d->next, i++);
+
+	/* Open the adapter */
+	if ((adhandle = pcap_open_live(d->name,	// name of the device
+		65536,			// portion of the packet to capture. 
+					   // 65536 grants that the whole packet will be captured on all the MACs.
+		1,				// promiscuous mode (nonzero means promiscuous)
+		1000,			// read timeout
+		errbuf			// error buffer
+	)) == NULL)
+	{
+		fprintf(stderr, "\nUnable to open the adapter. %s is not supported by WinPcap\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	/* Check the link layer. We support only Ethernet for simplicity. */
+	if (pcap_datalink(adhandle) != DLT_EN10MB)
+	{
+		fprintf(stderr, "\nThis program works only on Ethernet networks.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	if (d->addresses != NULL)
+		/* Retrieve the mask of the first address of the interface */
+		netmask = ((struct sockaddr_in*)(d->addresses->netmask))->sin_addr.S_un.S_addr;
+	else
+		/* If the interface is without addresses we suppose to be in a C class network */
+		netmask = 0xffffff;
+
+
+	//compile the filter
+	if (pcap_compile(adhandle, &fcode, packet_filter, 1, netmask) < 0)
+	{
+		fprintf(stderr, "\nUnable to compile the packet filter. Check the syntax.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	//set the filter
+	if (pcap_setfilter(adhandle, &fcode) < 0)
+	{
+		fprintf(stderr, "\nError setting the filter.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	printf("\nlistening on %s...\n", d->description);
+
+	/* At this point, we don't need any more the device list. Free it */
+	pcap_freealldevs(alldevs);
+
+	last_sec = GetTickCount64();
+	last_recv_output = GetTickCount64();
+	last_send_output = GetTickCount64();
+
+
+	/* start the capture */
+	pcap_loop(adhandle, 0, packet_handler, NULL);
+
+	pcap_close(adhandle);
+
+	fclose(fp);
+  
+	return 0;
+}
+
+/* Callback function invoked by libpcap for every incoming packet */
+void packet_handler(u_char* param, const struct pcap_pkthdr* header, const u_char* pkt_data)
+{
+	struct tm* ltime;
+	char timestr[30];
+	ip_header* ih;
+	mac_header* mh;
+	udp_header* uh;
+	u_int ip_len;
+	u_short sport, dport;
+	time_t local_tv_sec;
+
+	/*
+	 * unused parameter
+	 */
+	(VOID)(param);
+
+	/* convert the timestamp to readable format */
+	local_tv_sec = header->ts.tv_sec;
+	ltime = localtime(&local_tv_sec);
+	strftime(timestr, sizeof timestr, "%Y-%m-%d %H:%M:%S", ltime);
+
+	/* print timestamp and length of the packet */
+	printf("%s,", timestr);
+	fprintf(fp, "%s,", timestr);
+	fflush(fp);
+
+	mh = (mac_header*)pkt_data;
+	for (int i = 0; i < 5; i++) {
+		printf("%02X-", mh->src_addr[i]);
+		fprintf(fp, "%02X-", mh->src_addr[i]);
+	}
+	printf("%02X,", mh->src_addr[5]);
+	fprintf(fp, "%02X,", mh->src_addr[5]);
+
+	/* retireve the position of the ip header */
+	ih = (ip_header*)(pkt_data +
+		14); //length of ethernet header
+
+	/* retireve the position of the udp header */
+	ip_len = (ih->ver_ihl & 0xf) * 4;
+	uh = (udp_header*)((u_char*)ih + ip_len);
+
+	/* convert from network byte order to host byte order */
+	sport = ntohs(uh->sport);
+	dport = ntohs(uh->dport);
+
+	printf("%d.%d.%d.%d.%d,",
+		ih->saddr.byte1,
+		ih->saddr.byte2,
+		ih->saddr.byte3,
+		ih->saddr.byte4,
+		sport);
+	fprintf(fp, "%d.%d.%d.%d.%d,",
+		ih->saddr.byte1,
+		ih->saddr.byte2,
+		ih->saddr.byte3,
+		ih->saddr.byte4,
+		sport);
+
+	for (int i = 0; i < 5; i++) {
+		printf("%02X-", mh->dest_addr[i]);
+		fprintf(fp, "%02X-", mh->dest_addr[i]);
+	}
+	printf("%02X,", mh->dest_addr[5]);
+	fprintf(fp, "%02X,", mh->dest_addr[5]);
+
+	printf("%d.%d.%d.%d.%d,",
+		ih->daddr.byte1,
+		ih->daddr.byte2,
+		ih->daddr.byte3,
+		ih->daddr.byte4,
+		dport);
+	fprintf(fp, "%d.%d.%d.%d.%d,",
+		ih->daddr.byte1,
+		ih->daddr.byte2,
+		ih->daddr.byte3,
+		ih->daddr.byte4,
+		dport);
+
+	printf("%d\n", header->len);
+	fprintf(fp, "%d\n", header->len);
+
+  mac_address ma;
+	ip_address ia;
+	ia.byte1 = ih->saddr.byte1;
+	ia.byte2 = ih->saddr.byte2;
+	ia.byte3 = ih->saddr.byte3;
+	ia.byte4 = ih->saddr.byte4;
+	ma.byte0 = mh->src_addr[0];
+	ma.byte1 = mh->src_addr[1];
+	ma.byte2 = mh->src_addr[2];
+	ma.byte3 = mh->src_addr[3];
+	ma.byte4 = mh->src_addr[4];
+	ma.byte5 = mh->src_addr[5];
+	mac_address dma;
+	ip_address dia;
+	dia.byte1 = ih->daddr.byte1;
+	dia.byte2 = ih->daddr.byte2;
+	dia.byte3 = ih->daddr.byte3;
+	dia.byte4 = ih->daddr.byte4;
+	dma.byte0 = mh->dest_addr[0];
+	dma.byte1 = mh->dest_addr[1];
+	dma.byte2 = mh->dest_addr[2];
+	dma.byte3 = mh->dest_addr[3];
+	dma.byte4 = mh->dest_addr[4];
+	dma.byte5 = mh->dest_addr[5];
+	add_alarm_flow(&ma, &ia, ih->tlen);
+	add_recv_flow(&dma, &dia, ih->tlen);
+	add_recv_flow(&dma, &ia, ih->tlen);
+	add_send_flow(&ma, &ia, ih->tlen);
+}
+
+bool Equal(ip_address* IP_ADDR_0, ip_address* IP_ADDR_1, mac_address* MAC_ADDR_0, mac_address* MAC_ADDR_1) {
+	if ((IP_ADDR_0->byte1 == IP_ADDR_1->byte1) && (IP_ADDR_0->byte2 == IP_ADDR_1->byte2) &&
+		(IP_ADDR_0->byte3 == IP_ADDR_1->byte3) && (IP_ADDR_0->byte4 == IP_ADDR_1->byte4))
+	{
+		if ((MAC_ADDR_0->byte0 == MAC_ADDR_1->byte0) && (MAC_ADDR_0->byte1 == MAC_ADDR_1->byte1) &&
+			(MAC_ADDR_0->byte2 == MAC_ADDR_1->byte2) && (MAC_ADDR_0->byte3 == MAC_ADDR_1->byte3) &&
+			(MAC_ADDR_0->byte4 == MAC_ADDR_1->byte4) && (MAC_ADDR_0->byte5 == MAC_ADDR_1->byte5))
+			return true;//相等
+		else return false;
+	}
+	else return false;
+}
+
+//流量统计
+void add_alarm_flow(mac_address* mac_addr, ip_address* ip_addr, int flow) {
+	//流量重置
+	if (GetTickCount64() - last_sec >= 1000) {
+		for (int i = 0; i < flow_alarm_list->length; ++i) {
+			(flow_alarm_list->HEAD + i)->total = 0;
+		}
+		last_sec = GetTickCount64();
+	}
+
+	//流量统计
+	bool isFound = false;
+	for (int i = 0; i < flow_alarm_list->length; ++i) {
+		if (Equal(ip_addr, &(flow_alarm_list->HEAD + i)->IP, mac_addr, &(flow_alarm_list->HEAD + i)->MAC))
+		{
+			(flow_alarm_list->HEAD + i)->total += flow;
+			isFound = true;
+		}
+	}
+
+	if (!isFound) {
+		++(flow_alarm_list->length);
+		if ((flow_alarm_list->HEAD = (FLOW_STATEMENT*)realloc(flow_alarm_list->HEAD, (flow_alarm_list->length) * sizeof(FLOW_STATEMENT))) == NULL)
+			exit(-1);
+		if ((flow_alarm_list->HEAD + flow_alarm_list->length - 1) == NULL)
+			exit(-1);
+		(flow_alarm_list->HEAD + flow_alarm_list->length - 1)->MAC = *mac_addr;
+		(flow_alarm_list->HEAD + flow_alarm_list->length - 1)->IP = *ip_addr;
+		(flow_alarm_list->HEAD + flow_alarm_list->length - 1)->total = flow;
+	}
+
+	//流量报警
+	for (int i = 0; i < flow_alarm_list->length; ++i) {
+		if ((flow_alarm_list->HEAD + i)->total >= LIMIT) {
+			printf("%02X-%02X-%02X-%02X-%02X-%02X,%3d:%3d:%3d:%3d的流量超出阈值!\n",
+				(flow_alarm_list->HEAD + i)->MAC.byte0,
+				(flow_alarm_list->HEAD + i)->MAC.byte1,
+				(flow_alarm_list->HEAD + i)->MAC.byte2,
+				(flow_alarm_list->HEAD + i)->MAC.byte3,
+				(flow_alarm_list->HEAD + i)->MAC.byte4,
+				(flow_alarm_list->HEAD + i)->MAC.byte5,
+				(flow_alarm_list->HEAD + i)->IP.byte1,
+				(flow_alarm_list->HEAD + i)->IP.byte2,
+				(flow_alarm_list->HEAD + i)->IP.byte3,
+				(flow_alarm_list->HEAD + i)->IP.byte4);
+		}
+	}
+}
+
+void add_send_flow(mac_address* mac_addr, ip_address* ip_addr, int flow) {
+	//流量统计
+	bool isFound = false;
+
+	for (int i = 0; i < flow_send_list->length; ++i) {
+		if (Equal(ip_addr, &(flow_send_list->HEAD + i)->IP, mac_addr, &(flow_send_list->HEAD + i)->MAC))
+		{
+			(flow_send_list->HEAD + i)->total += flow;
+			isFound = true;
+		}
+
+	}
+
+	if (!isFound) {
+		++(flow_send_list->length);
+		if ((flow_send_list->HEAD = (FLOW_STATEMENT*)realloc(flow_send_list->HEAD, (flow_send_list->length) * sizeof(FLOW_STATEMENT))) == NULL)
+			exit(-1);
+		if ((flow_send_list->HEAD + flow_send_list->length - 1) == NULL)
+			exit(-1);
+		(flow_send_list->HEAD + flow_send_list->length - 1)->MAC = *mac_addr;
+		(flow_send_list->HEAD + flow_send_list->length - 1)->IP = *ip_addr;
+		(flow_send_list->HEAD + flow_send_list->length - 1)->total = flow;
+	}
+}
+
+//接收统计
+void add_recv_flow(mac_address* mac_addr, ip_address* ip_addr, int flow)
+{
+	//流量统计
+	bool isFound = false;
+	for (int i = 0; i < flow_recv_list->length; ++i) {
+		if (Equal(ip_addr, &(flow_recv_list->HEAD + i)->IP, mac_addr, &(flow_recv_list->HEAD + i)->MAC))
+		{
+			(flow_recv_list->HEAD + i)->total += flow;
+			isFound = true;
+		}
+	}
+
+	if (!isFound) {
+		++(flow_recv_list->length);
+		if ((flow_recv_list->HEAD = (FLOW_STATEMENT*)realloc(flow_recv_list->HEAD, (flow_recv_list->length) * sizeof(FLOW_STATEMENT))) == NULL)
+			exit(-1);
+		if ((flow_recv_list->HEAD + flow_recv_list->length - 1) == NULL)
+			exit(-1);
+		(flow_recv_list->HEAD + flow_recv_list->length - 1)->MAC = *mac_addr;
+		(flow_recv_list->HEAD + flow_recv_list->length - 1)->IP = *ip_addr;
+		(flow_recv_list->HEAD + flow_recv_list->length - 1)->total = flow;
+	}
+}
